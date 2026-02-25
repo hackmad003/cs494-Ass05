@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+"""
+PumpWatch Edge Anomaly Detection
+
+Outputs:
+  - anomalyScores.csv (per-window anomaly score + threshold + predicted + ground truth)
+  - anomalyDetection.png (score + threshold + predicted spans + ground truth spans)
+
+This is a normal-only anomaly detector using a tiny autoencoder on simple window features.
+"""
+import argparse
+import json
+import os
+import sys
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+
+
+@dataclass
+class Config:
+    csvPath: str
+    manifestPath: str
+    windowSize: int
+    stride: int
+    trainEndSec: float
+    percentile: float
+    epochs: int
+    batchSize: int
+    lr: float
+    seed: int
+    outputCSV: str
+    outputPlot: str
+
+
+def setSeeds(seed: int) -> None:
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+class TinyAutoencoder(nn.Module):
+    def __init__(self, inputDim: int, latentDim: int = 8):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(inputDim, 32),
+            nn.ReLU(),
+            nn.Linear(32, latentDim),
+            nn.ReLU(),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(latentDim, 32),
+            nn.ReLU(),
+            nn.Linear(32, inputDim),
+        )
+
+  
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.encoder(x)
+        y = self.decoder(z)
+        return y
+
+
+def loadManifest(path: str) -> Dict:
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def windowFeatures(window: np.ndarray) -> np.ndarray:
+    """
+    Extract 6-dimensional feature vector from a sensor window.
+    window shape: (windowSize, 3) -> features: mean(3) + std(3) => 6
+    """
+    meanVals = window.mean(axis=0)
+    stdVals = window.std(axis=0) + 1e-6
+    feats = np.concatenate([meanVals, stdVals], axis=0).astype(np.float32)
+    return feats
+
+
+def buildFeatureTable(df: pd.DataFrame, windowSize: int, stride: int) -> pd.DataFrame:
+    sensorCols = ["vibration", "motorTempProxy", "motorCurrentProxy"]
+
+    values = df[sensorCols].to_numpy(dtype=np.float32)
+    t = df["tSec"].to_numpy(dtype=np.float32)
+    labels = df["isAnomaly"].to_numpy(dtype=np.int32)
+
+    rows = []
+    for start in range(0, len(df) - windowSize + 1, stride):
+        end = start + windowSize
+        w = values[start:end]
+        feat = windowFeatures(w)
+
+        tCenter = float(t[start:end].mean())
+        gt = int(labels[start:end].max())
+
+        rows.append(
+            {
+                "tSec": tCenter,
+                "f0": float(feat[0]),
+                "f1": float(feat[1]),
+                "f2": float(feat[2]),
+                "f3": float(feat[3]),
+                "f4": float(feat[4]),
+                "f5": float(feat[5]),
+                "isAnomaly": gt,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+# ────────────────────────────────────────────────────────────────────
+# TODO 2: Add --device argument and resolveDevice() function
+#
+# Right now the script auto-detects the device (CUDA if available,
+# else CPU). Your task is to give the user explicit control:
+#
+#   1. Add a --device argument to the argparse block below with
+#      choices: "cpu", "cuda", "auto"  (default "auto")
+#
+#   2. Write a resolveDevice(choice) function that:
+#      - "auto" → use CUDA if available, else CPU
+#      - "cpu"  → always CPU
+#      - "cuda" → CUDA (raise an error if not available)
+#      Returns a torch.device.
+#
+#   3. Thread the resolved device through trainModel() and
+#      reconstructionMse() instead of the inline auto-detect
+#      that currently lives inside those functions.
+#
+#   4. Print the resolved device at startup so the user sees
+#      which device is being used.
+#
+# The auto-detect code in trainModel() and reconstructionMse()
+# keeps the script working NOW — your job is to replace it with
+# explicit --device control.
+# ────────────────────────────────────────────────────────────────────
+
+
+def trainModel(trainX: np.ndarray, cfg: Config) -> TinyAutoencoder:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = TinyAutoencoder(inputDim=trainX.shape[1], latentDim=8).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    lossFn = nn.MSELoss()
+
+    ds = torch.utils.data.TensorDataset(torch.from_numpy(trainX))
+    dl = torch.utils.data.DataLoader(ds, batch_size=cfg.batchSize, shuffle=True)
+
+    model.train()
+    for epoch in range(cfg.epochs):
+        totalLoss = 0.0
+        for (xb,) in dl:
+            xb = xb.to(device)
+            opt.zero_grad(set_to_none=True)
+            recon = model(xb)
+            loss = lossFn(recon, xb)
+            loss.backward()
+            opt.step()
+            totalLoss += float(loss.item()) * xb.shape[0]
+
+        if epoch in (0, cfg.epochs // 2, cfg.epochs - 1):
+            avgLoss = totalLoss / len(ds)
+            print(f"epoch={epoch:02d} avgTrainMSE={avgLoss:.6f}")
+
+    return model
+
+
+def reconstructionMse(model: TinyAutoencoder, x: np.ndarray) -> np.ndarray:
+    device = next(model.parameters()).device
+    model.eval()
+    with torch.no_grad():
+        xt = torch.from_numpy(x).to(device)
+        recon = model(xt)
+        mse = torch.mean((recon - xt) ** 2, dim=1).detach().cpu().numpy()
+    return mse
+
+
+def mergeSpans(t: np.ndarray, mask: np.ndarray, halfStep: float) -> List[Tuple[float, float]]:
+    """
+    Convert a boolean mask over timestamps into merged (start,end) spans.
+    halfStep controls how wide each point span is.
+    """
+    spans = []
+    inSpan = False
+    start = None
+    for i in range(len(t)):
+        if mask[i] and not inSpan:
+            inSpan = True
+            start = float(t[i] - halfStep)
+        if inSpan and (not mask[i] or i == len(t) - 1):
+            end = float(t[i] + halfStep)
+            spans.append((start, end))
+            inSpan = False
+            start = None
+    if inSpan and start is not None:
+        spans.append((start, float(t[-1] + halfStep)))
+    return spans
+
+
+def makePlot(outDf: pd.DataFrame, manifest: Dict, outputPlot: str) -> None:
+    t = outDf["tSec"].to_numpy(dtype=np.float64)
+    mse = outDf["mse"].to_numpy(dtype=np.float64)
+    thr = float(outDf["threshold"].iloc[0])
+    pred = outDf["predictedAnomaly"].to_numpy(dtype=np.int32) == 1
+    gt = outDf["isAnomaly"].to_numpy(dtype=np.int32) == 1
+
+    dt = float(np.median(np.diff(t))) if len(t) > 2 else 0.2
+    halfStep = dt / 2.0
+
+    predSpans = mergeSpans(t, pred, halfStep)
+    gtSpans = []
+    for ev in manifest.get("anomalyEvents", []):
+        gtSpans.append((float(ev["startSec"]), float(ev["endSec"]), ev.get("name", "event")))
+
+    plt.figure(figsize=(13, 6))
+    plt.plot(t, mse, linewidth=1.5, label="Anomaly score (reconstruction MSE)")
+    plt.axhline(y=thr, linestyle="--", linewidth=2, label=f"Threshold ({thr:.6f})")
+
+    for (s, e, name) in gtSpans:
+        plt.axvspan(s, e, alpha=0.12)
+        plt.text((s + e) / 2.0, thr, name, rotation=0, ha="center", va="bottom", fontsize=9)
+
+    for (s, e) in predSpans:
+        plt.axvspan(s, e, alpha=0.15)
+
+    yMin, yMax = float(mse.min()), float(mse.max())
+    pad = 0.12 * (yMax - yMin if yMax > yMin else 1.0)
+    baseY = yMin - pad
+    gtY = baseY + 0.03 * pad
+    predY = baseY + 0.07 * pad
+
+    plt.scatter(t[gt], np.full(gt.sum(), gtY), s=10, label="Ground truth anomaly (window)")
+    plt.scatter(t[pred], np.full(pred.sum(), predY), s=10, label="Predicted anomaly (window)")
+
+    plt.ylim([baseY - 0.02 * pad, yMax + 0.05 * (yMax - yMin if yMax > yMin else 1.0)])
+    plt.xlabel("Time (seconds since start)")
+    plt.ylabel("Score (MSE)")
+    plt.title("PumpWatch: Detected Anomalies vs Ground Truth (Normal-only Autoencoder)")
+    plt.grid(True, alpha=0.3)
+    plt.legend(loc="upper right")
+    plt.tight_layout()
+    plt.savefig(outputPlot, dpi=180)
+    plt.close()
+    print(f"Wrote plot: {outputPlot}")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--csv", dest="csvPath", required=True)
+    ap.add_argument("--manifest", dest="manifestPath", required=True)
+    ap.add_argument("--windowSize", type=int, default=50)
+    ap.add_argument("--stride", type=int, default=10)
+    ap.add_argument("--trainEndSec", type=float, default=330.0)
+    ap.add_argument("--percentile", type=float, default=99.5)
+    ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--batchSize", type=int, default=256)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--outputCSV", required=True)
+    ap.add_argument("--outputPlot", required=True)
+    args = ap.parse_args()
+
+    cfg = Config(
+        csvPath=args.csvPath,
+        manifestPath=args.manifestPath,
+        windowSize=args.windowSize,
+        stride=args.stride,
+        trainEndSec=args.trainEndSec,
+        percentile=args.percentile,
+        epochs=args.epochs,
+        batchSize=args.batchSize,
+        lr=args.lr,
+        seed=args.seed,
+        outputCSV=args.outputCSV,
+        outputPlot=args.outputPlot,
+    )
+
+    setSeeds(cfg.seed)
+
+    df = pd.read_csv(cfg.csvPath)
+    manifest = loadManifest(cfg.manifestPath)
+
+    featDf = buildFeatureTable(df, cfg.windowSize, cfg.stride)
+    featCols = ["f0", "f1", "f2", "f3", "f4", "f5"]
+
+    trainMask = (featDf["tSec"] <= cfg.trainEndSec) & (featDf["isAnomaly"] == 0)
+    trainFeat = featDf.loc[trainMask, featCols].to_numpy(dtype=np.float32)
+    mu = trainFeat.mean(axis=0)
+    sigma = trainFeat.std(axis=0) + 1e-6
+    trainXn = (trainFeat - mu) / sigma
+    allFeat = featDf[featCols].to_numpy(dtype=np.float32)
+    allXn = (allFeat - mu) / sigma
+
+    model = trainModel(trainXn, cfg)
+    allMSE = reconstructionMse(model, allXn)
+    trainMSE = reconstructionMse(model, trainXn)
+
+    threshold = float(np.percentile(trainMSE, cfg.percentile))
+    predicted = (allMSE > threshold).astype(np.int32)
+
+    outDf = pd.DataFrame(
+        {
+            "tSec": featDf["tSec"].to_numpy(dtype=np.float32),
+            "mse": allMSE.astype(np.float32),
+            "threshold": np.full(shape=len(allMSE), fill_value=threshold, dtype=np.float32),
+            "predictedAnomaly": predicted,
+            "isAnomaly": featDf["isAnomaly"].to_numpy(dtype=np.int32),
+        }
+    )
+
+    os.makedirs(os.path.dirname(cfg.outputCSV), exist_ok=True)
+    outDf.to_csv(cfg.outputCSV, index=False)
+    makePlot(outDf, manifest, cfg.outputPlot)
+
+    print("\nAll processing complete. Results are valid.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+      
